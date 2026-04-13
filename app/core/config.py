@@ -5,6 +5,11 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     SERVICE_NAME: str = "payment-service"
 
+    # Kafka
+    KAFKA_BOOTSTRAP_SERVERS: str = ""
+    KAFKA_API_KEY: str = ""
+    KAFKA_API_SECRET: str = ""
+
     # PayU Latam sandbox credentials
     PAYU_MERCHANT_ID: str = "508029"
     PAYU_API_KEY: str = "4Vj8eK4rloUd272L48hsrarnUA"

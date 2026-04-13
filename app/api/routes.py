@@ -3,15 +3,41 @@ import hashlib
 import logging
 import random
 import time
+from typing import List, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
+from app.kafka.producer import publish_event
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+class TicketEventItem(BaseModel):
+    code: str
+    seat: str
+    status: str = "ACTIVE"
+
+
+class PaymentEventContext(BaseModel):
+    order_id: int
+    user_id: int
+    user_email: str
+    customer_name: str
+    movie_id: int
+    movie_title: str
+    movie_genre: Optional[str] = None
+    movie_duration: Optional[int] = None
+    movie_rating: Optional[str] = None
+    quantity: int = Field(..., ge=1)
+    total_amount: float = Field(..., gt=0)
+    purchase_created_at: str
+    show_date: Optional[str] = None
+    show_time: Optional[str] = None
+    tickets: List[TicketEventItem] = Field(default_factory=list)
 
 
 class PaymentRequest(BaseModel):
@@ -21,6 +47,7 @@ class PaymentRequest(BaseModel):
     expiry_year: int = Field(..., ge=2024)
     cvv: str = Field(..., pattern=r"^\d{3,4}$")
     amount: float = Field(..., gt=0)
+    order_context: Optional[PaymentEventContext] = None
 
 
 class PaymentResult(BaseModel):
@@ -143,17 +170,38 @@ async def _process_payu(request: PaymentRequest) -> PaymentResult:
     )
 
 
+# Números de tarjeta que el simulador trata como rechazados (últimos 4 dígitos).
+# Útil para probar el camino negativo (payment.failed) sin activar PayU real.
+_SIMULATED_DECLINED_SUFFIXES = {"0002", "0019", "0127"}
+
+
 def _process_simulated(request: PaymentRequest) -> PaymentResult:
-    """MVP simulator — always approved."""
+    """
+    Simulador de tarjeta.
+    - Tarjetas cuyos últimos 4 dígitos coincidan con _SIMULATED_DECLINED_SUFFIXES → rechazadas.
+    - Cualquier otro número → aprobada.
+    """
+    last_four = request.card_number[-4:]
     transaction_id = f"TXN-{random.randint(100000, 999999)}"
+
+    if last_four in _SIMULATED_DECLINED_SUFFIXES:
+        logger.info(
+            "Simulated payment DECLINED | last_four=%s | amount=%.2f",
+            last_four, request.amount,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"Tarjeta rechazada por el banco. (simulación — terminación {last_four})",
+        )
+
     logger.info(
-        "Simulated payment | txn=%s | amount=%.2f | last_four=%s",
-        transaction_id, request.amount, request.card_number[-4:],
+        "Simulated payment APPROVED | txn=%s | amount=%.2f | last_four=%s",
+        transaction_id, request.amount, last_four,
     )
     return PaymentResult(
         transaction_id=transaction_id,
         status="approved",
-        last_four=request.card_number[-4:],
+        last_four=last_four,
         card_holder=request.card_holder,
         message="Payment processed successfully (simulated)",
     )
@@ -168,6 +216,7 @@ class PseRequest(BaseModel):
     document_number: str = Field(..., min_length=4, max_length=20)
     payer_email: str
     amount: float = Field(..., gt=0)
+    order_context: Optional[PaymentEventContext] = None
 
 
 class PseResult(BaseModel):
@@ -196,6 +245,45 @@ def _process_pse_simulated(request: PseRequest) -> PseResult:
     )
 
 
+async def _publish_payment_success(
+    context: Optional[PaymentEventContext],
+    transaction_id: str,
+    payment_last_four: str,
+) -> None:
+    if context is None:
+        return
+
+    payload = context.model_dump()
+    payload.update(
+        {
+            "transaction_id": transaction_id,
+            "payment_last_four": payment_last_four,
+        }
+    )
+    await publish_event("payment.success", payload)
+
+
+async def _publish_payment_failed(
+    context: Optional[PaymentEventContext],
+    reason: str,
+    transaction_id: str | None = None,
+) -> None:
+    if context is None:
+        return
+
+    payload = {
+        "order_id": context.order_id,
+        "user_id": context.user_id,
+        "user_email": context.user_email,
+        "movie_id": context.movie_id,
+        "quantity": context.quantity,
+        "total_amount": context.total_amount,
+        "failure_reason": reason,
+        "transaction_id": transaction_id,
+    }
+    await publish_event("payment.failed", payload)
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/payments/process", response_model=PaymentResult)
@@ -205,9 +293,25 @@ async def process_payment(request: PaymentRequest) -> PaymentResult:
     - Si PAYU_ENABLED=true → llama PayU sandbox
     - Si PAYU_ENABLED=false → simulador MVP (siempre aprueba)
     """
-    if settings.PAYU_ENABLED:
-        return await _process_payu(request)
-    return _process_simulated(request)
+    try:
+        result = await _process_payu(request) if settings.PAYU_ENABLED else _process_simulated(request)
+    except HTTPException as exc:
+        await _publish_payment_failed(request.order_context, str(exc.detail))
+        raise
+    except Exception as exc:
+        logger.error("Unexpected payment processing error: %s", exc)
+        await _publish_payment_failed(
+            request.order_context,
+            "Error inesperado procesando el pago.",
+        )
+        raise
+
+    await _publish_payment_success(
+        request.order_context,
+        transaction_id=result.transaction_id,
+        payment_last_four=result.last_four,
+    )
+    return result
 
 
 @router.post("/payments/process-pse", response_model=PseResult)
@@ -216,7 +320,25 @@ async def process_pse_payment(request: PseRequest) -> PseResult:
     Procesa un pago PSE (simulado).
     En producción: integrar con Mercado Pago API (requiere callback URL pública).
     """
-    return _process_pse_simulated(request)
+    try:
+        result = _process_pse_simulated(request)
+    except HTTPException as exc:
+        await _publish_payment_failed(request.order_context, str(exc.detail))
+        raise
+    except Exception as exc:
+        logger.error("Unexpected PSE processing error: %s", exc)
+        await _publish_payment_failed(
+            request.order_context,
+            "Error inesperado procesando el pago PSE.",
+        )
+        raise
+
+    await _publish_payment_success(
+        request.order_context,
+        transaction_id=result.transaction_id,
+        payment_last_four="****",
+    )
+    return result
 
 
 # ── Refund ────────────────────────────────────────────────────────────────────

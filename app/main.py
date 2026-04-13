@@ -1,7 +1,10 @@
 # app/main.py
 import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from app.api.routes import router
+from app.kafka.producer import start_producer, stop_producer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -9,10 +12,24 @@ logging.basicConfig(
 )
 
 from app.core.config import settings
-app = FastAPI(title="Payment Service")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await start_producer()
+    yield
+    await stop_producer()
+
+
+app = FastAPI(title="Payment Service", lifespan=lifespan)
 app.include_router(router)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "payment-service"}
+    kafka_enabled = bool(settings.KAFKA_BOOTSTRAP_SERVERS)
+    return {
+        "status": "healthy",
+        "service": "payment-service",
+        "kafka": "configured" if kafka_enabled else "disabled",
+    }
