@@ -8,6 +8,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
+from app.core.config import settings
 app = FastAPI(title="Payment Service")
 app.include_router(router)
 
