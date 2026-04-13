@@ -217,3 +217,97 @@ async def process_pse_payment(request: PseRequest) -> PseResult:
     En producción: integrar con Mercado Pago API (requiere callback URL pública).
     """
     return _process_pse_simulated(request)
+
+
+# ── Refund ────────────────────────────────────────────────────────────────────
+
+class RefundRequest(BaseModel):
+    transaction_id: str
+    amount: float = Field(..., gt=0)
+
+
+class RefundResult(BaseModel):
+    transaction_id: str
+    refund_id: str
+    status: str       # approved | failed
+    message: str
+
+
+def _process_simulated_refund(request: RefundRequest) -> RefundResult:
+    """Reembolso simulado — siempre aprobado."""
+    refund_id = f"REF-{random.randint(100000, 999999)}"
+    logger.info(
+        "Simulated refund | refund_id=%s | original_txn=%s | amount=%.2f",
+        refund_id, request.transaction_id, request.amount,
+    )
+    return RefundResult(
+        transaction_id=request.transaction_id,
+        refund_id=refund_id,
+        status="approved",
+        message=f"Reembolso de ${request.amount:,.0f} COP procesado exitosamente.",
+    )
+
+
+async def _process_payu_refund(request: RefundRequest) -> RefundResult:
+    """Llama PayU sandbox para reembolsar usando parentTransactionId."""
+    refund_reference = f"REF-{int(time.time())}-{random.randint(1000, 9999)}"
+    body = {
+        "language": "es",
+        "command": "SUBMIT_TRANSACTION",
+        "merchant": {
+            "apiLogin": settings.PAYU_API_LOGIN,
+            "apiKey": settings.PAYU_API_KEY,
+        },
+        "transaction": {
+            "order": {
+                "id": request.transaction_id,
+            },
+            "type": "REFUND",
+            "parentTransactionId": request.transaction_id,
+            "reason": "Cancelación solicitada por el cliente",
+        },
+        "test": True,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(settings.PAYU_BASE_URL, json=body)
+            resp.raise_for_status()
+    except Exception as exc:
+        logger.error("PayU refund request failed: %s", exc)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Error comunicándose con la pasarela de pagos para el reembolso.",
+        )
+
+    data = resp.json()
+    txn_resp = data.get("transactionResponse", {})
+    payu_state = txn_resp.get("state", "ERROR")
+    refund_id = txn_resp.get("transactionId", refund_reference)
+
+    logger.info("PayU refund | state=%s | refund_id=%s | original=%s", payu_state, refund_id, request.transaction_id)
+
+    if payu_state in ("APPROVED", "PENDING"):
+        return RefundResult(
+            transaction_id=request.transaction_id,
+            refund_id=refund_id,
+            status="approved",
+            message="Reembolso aprobado exitosamente.",
+        )
+
+    raise HTTPException(
+        status.HTTP_400_BAD_REQUEST,
+        f"El reembolso fue rechazado por la pasarela de pagos (estado: {payu_state}).",
+    )
+
+
+@router.post("/payments/refund", response_model=RefundResult)
+async def process_refund(request: RefundRequest) -> RefundResult:
+    """
+    Procesa el reembolso de una transacción existente.
+    - Si PAYU_ENABLED=true → llama PayU sandbox con REFUND command
+    - Si PAYU_ENABLED=false → simulador (siempre aprueba)
+    """
+    if settings.PAYU_ENABLED:
+        return await _process_payu_refund(request)
+    return _process_simulated_refund(request)
