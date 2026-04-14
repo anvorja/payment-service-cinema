@@ -38,6 +38,9 @@ class PaymentEventContext(BaseModel):
     show_date: Optional[str] = None
     show_time: Optional[str] = None
     showtime_id: Optional[int] = None
+    theater_name: Optional[str] = None
+    theater_location: Optional[str] = None
+    show_format: Optional[str] = None
     tickets: List[TicketEventItem] = Field(default_factory=list)
 
 
