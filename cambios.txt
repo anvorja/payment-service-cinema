@@ -1,0 +1,12 @@
+payment-service/app/kafka/consumer.py
+
+Suscribe a payment.initiated. El handler reconstruye el modelo correcto (PaymentRequest o PseRequest) según el campo flow, llama al mismo procesador
+que usaba el endpoint HTTP, y publica payment.success o payment.failed. Si el procesador lanza HTTPException (tarjeta rechazada, por ejemplo), lo
+atrapa y lo convierte en payment.failed — es la frontera correcta entre el dominio HTTP y el dominio de eventos.
+
+payment-service/app/main.py
+
+Arranca el consumer como asyncio.create_task dentro del lifespan. El shutdown cancela la tarea y espera CancelledError antes de bajar el producer —
+orden correcto para no perder mensajes en vuelo.
+
+

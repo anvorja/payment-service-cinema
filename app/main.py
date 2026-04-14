@@ -1,9 +1,12 @@
 # app/main.py
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+
 from app.api.routes import router
+from app.kafka.consumer import start_consumer
 from app.kafka.producer import start_producer, stop_producer
 
 logging.basicConfig(
@@ -17,7 +20,13 @@ from app.core.config import settings
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await start_producer()
+    consumer_task = asyncio.create_task(start_consumer())
     yield
+    consumer_task.cancel()
+    try:
+        await consumer_task
+    except asyncio.CancelledError:
+        pass
     await stop_producer()
 
 
