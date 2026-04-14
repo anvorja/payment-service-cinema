@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import ssl
+from datetime import datetime, timezone
 
 from aiokafka import AIOKafkaConsumer
 from fastapi import HTTPException
@@ -18,6 +19,21 @@ from app.kafka.producer import publish_event
 logger = logging.getLogger(__name__)
 
 _RESTART_DELAY = 10
+
+
+async def _send_to_dlq(topic: str, payload: dict, error: Exception) -> None:
+    """Publica el mensaje fallido en el topic DLQ correspondiente antes de commitear el offset."""
+    dlq_topic = f"{topic}.dlq"
+    try:
+        await publish_event(dlq_topic, {
+            "original_topic": topic,
+            "original_payload": payload,
+            "error": str(error),
+            "failed_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.warning("Mensaje enviado al DLQ | dlq_topic=%s", dlq_topic)
+    except Exception as dlq_exc:
+        logger.error("No se pudo publicar al DLQ | dlq_topic=%s | error=%s", dlq_topic, dlq_exc)
 
 
 async def _handle_payment_initiated(payload: dict) -> None:
@@ -124,6 +140,7 @@ async def _run_consumer() -> None:
                     await handler(msg.value)
                 except Exception as exc:
                     logger.error("Error procesando %s: %s", msg.topic, exc)
+                    await _send_to_dlq(msg.topic, msg.value, exc)
             await consumer.commit()
     except asyncio.CancelledError:
         raise
