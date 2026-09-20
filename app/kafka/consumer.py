@@ -123,7 +123,7 @@ async def _run_consumer() -> None:
         sasl_plain_username=settings.KAFKA_API_KEY,
         sasl_plain_password=settings.KAFKA_API_SECRET,
         ssl_context=ssl_context,
-        group_id="payment-service-group",
+        group_id=settings.KAFKA_GROUP_ID,
         auto_offset_reset="latest",
         enable_auto_commit=False,
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),

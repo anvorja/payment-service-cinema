@@ -9,6 +9,11 @@ class Settings(BaseSettings):
     KAFKA_BOOTSTRAP_SERVERS: str = ""
     KAFKA_API_KEY: str = ""
     KAFKA_API_SECRET: str = ""
+    # Default = group_id histórico de producción, sin variable nueva en Render.
+    # Local lo sobreescribe con sufijo "-local" — dev y prod comparten el
+    # mismo cluster de Confluent Cloud, y sin distinguir el group_id ambos
+    # entornos terminan en el MISMO grupo de consumidores.
+    KAFKA_GROUP_ID: str = "payment-service-group"
 
     # PayU Latam sandbox credentials
     PAYU_MERCHANT_ID: str = "508029"
