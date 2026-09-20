@@ -4,6 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.api.routes import router
 from app.kafka.consumer import start_consumer
@@ -31,6 +32,10 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Payment Service", lifespan=lifespan)
+
+# Métricas de Prometheus (latencia/conteo por endpoint) en /metrics
+Instrumentator().instrument(app).expose(app)
+
 app.include_router(router)
 
 
