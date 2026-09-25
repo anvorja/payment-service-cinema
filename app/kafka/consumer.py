@@ -1,8 +1,10 @@
 # app/kafka/consumer.py — payment-service
 #
-# Consume eventos de dominio que activan el procesamiento de pagos:
-#   • payment.initiated → procesa el pago (tarjeta o PSE) y publica
-#     payment.success o payment.failed según el resultado.
+# Consume eventos de dominio que activan el cobro:
+#   • payment.initiated (flow=wompi) → crea el cobro de las boletas en
+#     cinema_payments. La persona paga en el Web Checkout de Wompi; el
+#     resultado llega por el webhook, al volver de Wompi o por el
+#     reconciliador, y ahí se publica payment.success o payment.failed.
 #
 import asyncio
 import json
@@ -11,10 +13,11 @@ import ssl
 from datetime import datetime, timezone
 
 from aiokafka import AIOKafkaConsumer
-from fastapi import HTTPException
 
 from app.core.config import settings
+from app.core.database import SessionLocal
 from app.kafka.producer import publish_event
+from app.services.payments import start_ticket_checkout
 
 logger = logging.getLogger(__name__)
 
@@ -36,76 +39,41 @@ async def _send_to_dlq(topic: str, payload: dict, error: Exception) -> None:
         logger.error("No se pudo publicar al DLQ | dlq_topic=%s | error=%s", dlq_topic, dlq_exc)
 
 
+def _parse_expires_at(value: str) -> datetime:
+    moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
 async def _handle_payment_initiated(payload: dict) -> None:
     """
-    Procesa un evento payment.initiated emitido por booking-service.
-
-    El payload contiene el método de pago ('flow': 'card' | 'pse'),
-    las credenciales correspondientes y el contexto de la orden.
-    Publica payment.success o payment.failed según el resultado.
+    booking-service ya reservó el inventario y pide cobrar la compra. El
+    enlace de Wompi vence en expires_at, que fija booking (retiene los
+    asientos hasta entonces). Idempotente por order_id.
     """
-    # Importación local para evitar dependencia circular en el arranque del módulo.
-    from app.api.routes import (
-        PaymentEventContext,
-        PaymentRequest,
-        PseRequest,
-        _process_payu,
-        _process_pse_simulated,
-        _process_simulated,
-        _publish_payment_failed,
-        _publish_payment_success,
-    )
-
     flow = payload.get("flow")
-    raw_context = payload.get("order_context")
-    order_context = PaymentEventContext(**raw_context) if raw_context else None
+    context = payload.get("order_context") or {}
+    if flow != "wompi":
+        # Flujos retirados (card/pse con datos de tarjeta en el evento).
+        logger.error("payment.initiated con flujo no soportado: '%s' | order_id=%s", flow, context.get("order_id"))
+        await publish_event("payment.failed", {
+            "order_id": context.get("order_id"),
+            "user_id": context.get("user_id"),
+            "user_email": context.get("user_email"),
+            "movie_id": context.get("movie_id"),
+            "quantity": context.get("quantity"),
+            "total_amount": context.get("total_amount"),
+            "failure_reason": "Medio de pago no soportado. Intenta de nuevo.",
+            "transaction_id": None,
+        })
+        return
 
-    try:
-        if flow == "card":
-            request = PaymentRequest(
-                card_number=payload["card_number"],
-                card_holder=payload["card_holder"],
-                expiry_month=payload["expiry_month"],
-                expiry_year=payload["expiry_year"],
-                cvv=payload["cvv"],
-                amount=payload["amount"],
-                order_context=order_context,
-            )
-            result = await _process_payu(request) if settings.PAYU_ENABLED else _process_simulated(request)
-            await _publish_payment_success(order_context, result.transaction_id, result.last_four)
-
-        elif flow == "pse":
-            request = PseRequest(
-                bank_code=payload["bank_code"],
-                bank_name=payload["bank_name"],
-                document_type=payload["document_type"],
-                document_number=payload["document_number"],
-                payer_email=payload["payer_email"],
-                amount=payload["amount"],
-                order_context=order_context,
-            )
-            result = _process_pse_simulated(request)
-            await _publish_payment_success(order_context, result.transaction_id, "****")
-
-        else:
-            logger.error("payment.initiated con flow desconocido: '%s'", flow)
-            await _publish_payment_failed(order_context, f"Flujo de pago no reconocido: {flow}")
-
-    except HTTPException as exc:
-        order_id = (raw_context or {}).get("order_id")
-        logger.warning(
-            "Pago rechazado | order_id=%s | status=%s | detail=%s",
-            order_id, exc.status_code, exc.detail,
+    with SessionLocal() as db:
+        start_ticket_checkout(
+            db,
+            order_context=context,
+            amount=float(payload["amount"]),
+            expires_at=_parse_expires_at(payload["expires_at"]),
         )
-        await _publish_payment_failed(order_context, str(exc.detail))
-
-    except Exception as exc:
-        order_id = (raw_context or {}).get("order_id")
-        logger.error(
-            "Error inesperado procesando payment.initiated | order_id=%s | error=%s",
-            order_id, exc,
-        )
-        await _publish_payment_failed(order_context, "Error inesperado en el procesamiento del pago.")
 
 
 _HANDLERS: dict = {
